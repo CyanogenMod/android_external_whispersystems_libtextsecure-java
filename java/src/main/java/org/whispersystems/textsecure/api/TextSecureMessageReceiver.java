@@ -18,7 +18,10 @@ package org.whispersystems.textsecure.api;
 
 import org.whispersystems.libaxolotl.InvalidMessageException;
 import org.whispersystems.textsecure.api.crypto.AttachmentCipherInputStream;
+import org.whispersystems.textsecure.api.messages.TextSecureAttachment;
+import org.whispersystems.textsecure.api.messages.TextSecureAttachment.ProgressListener;
 import org.whispersystems.textsecure.api.messages.TextSecureAttachmentPointer;
+import org.whispersystems.textsecure.api.messages.TextSecureDataMessage;
 import org.whispersystems.textsecure.api.messages.TextSecureEnvelope;
 import org.whispersystems.textsecure.api.push.TrustStore;
 import org.whispersystems.textsecure.api.util.CredentialsProvider;
@@ -44,6 +47,7 @@ public class TextSecureMessageReceiver {
   private final TrustStore          trustStore;
   private final String              url;
   private final CredentialsProvider credentialsProvider;
+  private final String              userAgent;
 
   /**
    * Construct a TextSecureMessageReceiver.
@@ -56,9 +60,10 @@ public class TextSecureMessageReceiver {
    * @param signalingKey The 52 byte signaling key assigned to this user at registration.
    */
   public TextSecureMessageReceiver(String url, TrustStore trustStore,
-                                   String user, String password, String signalingKey)
+                                   String user, String password,
+                                   String signalingKey, String userAgent)
   {
-    this(url, trustStore, new StaticCredentialsProvider(user, password, signalingKey));
+    this(url, trustStore, new StaticCredentialsProvider(user, password, signalingKey), userAgent);
   }
 
   /**
@@ -69,18 +74,21 @@ public class TextSecureMessageReceiver {
    *                   the server's TLS signing certificate.
    * @param credentials The TextSecure user's credentials.
    */
-  public TextSecureMessageReceiver(String url, TrustStore trustStore, CredentialsProvider credentials) {
+  public TextSecureMessageReceiver(String url, TrustStore trustStore,
+                                   CredentialsProvider credentials, String userAgent)
+  {
     this.url                 = url;
     this.trustStore          = trustStore;
     this.credentialsProvider = credentials;
-    this.socket              = new PushServiceSocket(url, trustStore, credentials);
+    this.socket              = new PushServiceSocket(url, trustStore, credentials, userAgent);
+    this.userAgent           = userAgent;
   }
 
   /**
    * Retrieves a TextSecure attachment.
    *
    * @param pointer The {@link org.whispersystems.textsecure.api.messages.TextSecureAttachmentPointer}
-   *                received in a {@link org.whispersystems.textsecure.api.messages.TextSecureMessage}.
+   *                received in a {@link TextSecureDataMessage}.
    * @param destination The download destination for this attachment.
    *
    * @return An InputStream that streams the plaintext attachment contents.
@@ -90,7 +98,26 @@ public class TextSecureMessageReceiver {
   public InputStream retrieveAttachment(TextSecureAttachmentPointer pointer, File destination)
       throws IOException, InvalidMessageException
   {
-    socket.retrieveAttachment(pointer.getRelay().orNull(), pointer.getId(), destination);
+    return retrieveAttachment(pointer, destination, null);
+  }
+
+
+  /**
+   * Retrieves a TextSecure attachment.
+   *
+   * @param pointer The {@link org.whispersystems.textsecure.api.messages.TextSecureAttachmentPointer}
+   *                received in a {@link TextSecureDataMessage}.
+   * @param destination The download destination for this attachment.
+   * @param listener An optional listener (may be null) to receive callbacks on download progress.
+   *
+   * @return An InputStream that streams the plaintext attachment contents.
+   * @throws IOException
+   * @throws InvalidMessageException
+   */
+  public InputStream retrieveAttachment(TextSecureAttachmentPointer pointer, File destination, ProgressListener listener)
+      throws IOException, InvalidMessageException
+  {
+    socket.retrieveAttachment(pointer.getRelay().orNull(), pointer.getId(), destination, listener);
     return new AttachmentCipherInputStream(destination, pointer.getKey());
   }
 
@@ -102,7 +129,7 @@ public class TextSecureMessageReceiver {
    * @return A TextSecureMessagePipe for receiving TextSecure messages.
    */
   public TextSecureMessagePipe createMessagePipe() {
-    WebSocketConnection webSocket = new WebSocketConnection(url, trustStore, credentialsProvider);
+    WebSocketConnection webSocket = new WebSocketConnection(url, trustStore, credentialsProvider, userAgent);
     return new TextSecureMessagePipe(webSocket, credentialsProvider);
   }
 
@@ -119,7 +146,8 @@ public class TextSecureMessageReceiver {
     for (TextSecureEnvelopeEntity entity : entities) {
       TextSecureEnvelope envelope =  new TextSecureEnvelope(entity.getType(), entity.getSource(),
                                                             entity.getSourceDevice(), entity.getRelay(),
-                                                            entity.getTimestamp(), entity.getMessage());
+                                                            entity.getTimestamp(), entity.getMessage(),
+                                                            entity.getContent());
 
       callback.onMessage(envelope);
       results.add(envelope);

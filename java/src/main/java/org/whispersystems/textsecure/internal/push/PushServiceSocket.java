@@ -17,6 +17,7 @@
 package org.whispersystems.textsecure.internal.push;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.JsonProcessingException;
 
 import org.apache.http.conn.ssl.StrictHostnameVerifier;
 import org.whispersystems.libaxolotl.IdentityKey;
@@ -27,9 +28,11 @@ import org.whispersystems.libaxolotl.state.PreKeyRecord;
 import org.whispersystems.libaxolotl.state.SignedPreKeyRecord;
 import org.whispersystems.libaxolotl.util.guava.Optional;
 import org.whispersystems.textsecure.api.crypto.AttachmentCipherOutputStream;
+import org.whispersystems.textsecure.api.messages.TextSecureAttachment.ProgressListener;
+import org.whispersystems.textsecure.api.messages.multidevice.DeviceInfo;
 import org.whispersystems.textsecure.api.push.ContactTokenDetails;
-import org.whispersystems.textsecure.api.push.TextSecureAddress;
 import org.whispersystems.textsecure.api.push.SignedPreKeyEntity;
+import org.whispersystems.textsecure.api.push.TextSecureAddress;
 import org.whispersystems.textsecure.api.push.TrustStore;
 import org.whispersystems.textsecure.api.push.exceptions.AuthorizationFailedException;
 import org.whispersystems.textsecure.api.push.exceptions.ExpectationFailedException;
@@ -76,8 +79,11 @@ public class PushServiceSocket {
 
   private static final String CREATE_ACCOUNT_SMS_PATH   = "/v1/accounts/sms/code/%s";
   private static final String CREATE_ACCOUNT_VOICE_PATH = "/v1/accounts/voice/code/%s";
-  private static final String VERIFY_ACCOUNT_PATH       = "/v1/accounts/code/%s";
+  private static final String VERIFY_ACCOUNT_CODE_PATH  = "/v1/accounts/code/%s";
+  private static final String VERIFY_ACCOUNT_TOKEN_PATH = "/v1/accounts/token/%s";
   private static final String REGISTER_GCM_PATH         = "/v1/accounts/gcm/";
+  private static final String REQUEST_TOKEN_PATH        = "/v1/accounts/token";
+  private static final String SET_ACCOUNT_ATTRIBUTES    = "/v1/acccounts/attributes";
 
   private static final String PREKEY_METADATA_PATH      = "/v2/keys/";
   private static final String PREKEY_PATH               = "/v2/keys/%s";
@@ -86,6 +92,7 @@ public class PushServiceSocket {
 
   private static final String PROVISIONING_CODE_PATH    = "/v1/devices/provisioning/code";
   private static final String PROVISIONING_MESSAGE_PATH = "/v1/provisioning/%s";
+  private static final String DEVICE_PATH               = "/v1/devices/%s";
 
   private static final String DIRECTORY_TOKENS_PATH     = "/v1/directory/tokens";
   private static final String DIRECTORY_VERIFY_PATH     = "/v1/directory/%s";
@@ -99,12 +106,14 @@ public class PushServiceSocket {
   private final String              serviceUrl;
   private final TrustManager[]      trustManagers;
   private final CredentialsProvider credentialsProvider;
+  private final String              userAgent;
 
-  public PushServiceSocket(String serviceUrl, TrustStore trustStore, CredentialsProvider credentialsProvider)
+  public PushServiceSocket(String serviceUrl, TrustStore trustStore, CredentialsProvider credentialsProvider, String userAgent)
   {
     this.serviceUrl          = serviceUrl;
     this.credentialsProvider = credentialsProvider;
     this.trustManagers       = BlacklistingTrustManager.createFor(trustStore);
+    this.userAgent           = userAgent;
   }
 
   public void createAccount(boolean voice) throws IOException {
@@ -112,18 +121,44 @@ public class PushServiceSocket {
     makeRequest(String.format(path, credentialsProvider.getUser()), "GET", null);
   }
 
-  public void verifyAccount(String verificationCode, String signalingKey,
-                            boolean supportsSms, int registrationId)
+  public void verifyAccountCode(String verificationCode, String signalingKey, int registrationId, boolean voice)
       throws IOException
   {
-    AccountAttributes signalingKeyEntity = new AccountAttributes(signalingKey, supportsSms, registrationId);
-    makeRequest(String.format(VERIFY_ACCOUNT_PATH, verificationCode),
+    AccountAttributes signalingKeyEntity = new AccountAttributes(signalingKey, registrationId, voice);
+    makeRequest(String.format(VERIFY_ACCOUNT_CODE_PATH, verificationCode),
                 "PUT", JsonUtil.toJson(signalingKeyEntity));
+  }
+
+  public void verifyAccountToken(String verificationToken, String signalingKey, int registrationId, boolean voice)
+      throws IOException
+  {
+    AccountAttributes signalingKeyEntity = new AccountAttributes(signalingKey, registrationId, voice);
+    makeRequest(String.format(VERIFY_ACCOUNT_TOKEN_PATH, verificationToken),
+                "PUT", JsonUtil.toJson(signalingKeyEntity));
+  }
+
+  public void setAccountAttributes(String signalingKey, int registrationId, boolean voice) throws IOException {
+    AccountAttributes accountAttributes = new AccountAttributes(signalingKey, registrationId, voice);
+    makeRequest(SET_ACCOUNT_ATTRIBUTES, "PUT", JsonUtil.toJson(accountAttributes));
+  }
+
+  public String getAccountVerificationToken() throws IOException {
+    String responseText = makeRequest(REQUEST_TOKEN_PATH, "GET", null);
+    return JsonUtil.fromJson(responseText, AuthorizationToken.class).getToken();
   }
 
   public String getNewDeviceVerificationCode() throws IOException {
     String responseText = makeRequest(PROVISIONING_CODE_PATH, "GET", null);
     return JsonUtil.fromJson(responseText, DeviceCode.class).getVerificationCode();
+  }
+
+  public List<DeviceInfo> getDevices() throws IOException {
+    String responseText = makeRequest(String.format(DEVICE_PATH, ""), "GET", null);
+    return JsonUtil.fromJson(responseText, DeviceInfoList.class).getDevices();
+  }
+
+  public void removeDevice(long deviceId) throws IOException {
+    makeRequest(String.format(DEVICE_PATH, String.valueOf(deviceId)), "DELETE", null);
   }
 
   public void sendProvisioningMessage(String destination, byte[] body) throws IOException {
@@ -247,8 +282,6 @@ public class PushServiceSocket {
       }
 
       return bundles;
-    } catch (JsonUtil.JsonParseException e) {
-      throw new IOException(e);
     } catch (NotFoundException nfe) {
       throw new UnregisteredUserException(destination.getNumber(), nfe);
     }
@@ -289,8 +322,6 @@ public class PushServiceSocket {
 
       return new PreKeyBundle(device.getRegistrationId(), device.getDeviceId(), preKeyId, preKey,
                               signedPreKeyId, signedPreKey, signedPreKeySignature, response.getIdentityKey());
-    } catch (JsonUtil.JsonParseException e) {
-      throw new IOException(e);
     } catch (NotFoundException nfe) {
       throw new UnregisteredUserException(destination.getNumber(), nfe);
     }
@@ -324,12 +355,12 @@ public class PushServiceSocket {
     Log.w(TAG, "Got attachment content location: " + attachmentKey.getLocation());
 
     uploadAttachment("PUT", attachmentKey.getLocation(), attachment.getData(),
-                     attachment.getDataSize(), attachment.getKey());
+                     attachment.getDataSize(), attachment.getKey(), attachment.getListener());
 
     return attachmentKey.getId();
   }
 
-  public void retrieveAttachment(String relay, long attachmentId, File destination) throws IOException {
+  public void retrieveAttachment(String relay, long attachmentId, File destination, ProgressListener listener) throws IOException {
     String path = String.format(ATTACHMENT_PATH, String.valueOf(attachmentId));
 
     if (!Util.isEmpty(relay)) {
@@ -341,17 +372,22 @@ public class PushServiceSocket {
 
     Log.w(TAG, "Attachment: " + attachmentId + " is at: " + descriptor.getLocation());
 
-    downloadExternalFile(descriptor.getLocation(), destination);
+    downloadExternalFile(descriptor.getLocation(), destination, listener);
   }
 
   public List<ContactTokenDetails> retrieveDirectory(Set<String> contactTokens)
       throws NonSuccessfulResponseCodeException, PushNetworkException
   {
-    ContactTokenList        contactTokenList = new ContactTokenList(new LinkedList<>(contactTokens));
-    String                  response         = makeRequest(DIRECTORY_TOKENS_PATH, "PUT", JsonUtil.toJson(contactTokenList));
-    ContactTokenDetailsList activeTokens     = JsonUtil.fromJson(response, ContactTokenDetailsList.class);
+    try {
+      ContactTokenList        contactTokenList = new ContactTokenList(new LinkedList<>(contactTokens));
+      String                  response         = makeRequest(DIRECTORY_TOKENS_PATH, "PUT", JsonUtil.toJson(contactTokenList));
+      ContactTokenDetailsList activeTokens     = JsonUtil.fromJson(response, ContactTokenDetailsList.class);
 
-    return activeTokens.getContacts();
+      return activeTokens.getContacts();
+    } catch (IOException e) {
+      Log.w(TAG, e);
+      throw new NonSuccessfulResponseCodeException("Unable to parse entity");
+    }
   }
 
   public ContactTokenDetails getContactTokenDetails(String contactToken) throws IOException {
@@ -363,7 +399,7 @@ public class PushServiceSocket {
     }
   }
 
-  private void downloadExternalFile(String url, File localDestination)
+  private void downloadExternalFile(String url, File localDestination, ProgressListener listener)
       throws IOException
   {
     URL               downloadUrl = new URL(url);
@@ -377,13 +413,19 @@ public class PushServiceSocket {
         throw new NonSuccessfulResponseCodeException("Bad response: " + connection.getResponseCode());
       }
 
-      OutputStream output = new FileOutputStream(localDestination);
-      InputStream input   = connection.getInputStream();
-      byte[] buffer       = new byte[4096];
-      int read;
+      OutputStream output        = new FileOutputStream(localDestination);
+      InputStream  input         = connection.getInputStream();
+      byte[]       buffer        = new byte[4096];
+      int          contentLength = connection.getContentLength();
+      int         read,totalRead = 0;
 
       while ((read = input.read(buffer)) != -1) {
         output.write(buffer, 0, read);
+        totalRead += read;
+
+        if (listener != null) {
+          listener.onAttachmentProgress(contentLength, totalRead);
+        }
       }
 
       output.close();
@@ -395,7 +437,8 @@ public class PushServiceSocket {
     }
   }
 
-  private void uploadAttachment(String method, String url, InputStream data, long dataSize, byte[] key)
+  private void uploadAttachment(String method, String url, InputStream data,
+                                long dataSize, byte[] key, ProgressListener listener)
     throws IOException
   {
     URL                uploadUrl  = new URL(url);
@@ -416,9 +459,21 @@ public class PushServiceSocket {
     try {
       OutputStream                 stream = connection.getOutputStream();
       AttachmentCipherOutputStream out    = new AttachmentCipherOutputStream(key, stream);
+      byte[]                       buffer = new byte[4096];
+      int                   read, written = 0;
 
-      Util.copy(data, out);
+      while ((read = data.read(buffer)) != -1) {
+        out.write(buffer, 0, read);
+        written += read;
+
+        if (listener != null) {
+          listener.onAttachmentProgress(dataSize, written);
+        }
+      }
+
+      data.close();
       out.flush();
+      out.close();
 
       if (connection.getResponseCode() != 200) {
         throw new IOException("Bad response: " + connection.getResponseCode() + " " + connection.getResponseMessage());
@@ -470,19 +525,45 @@ public class PushServiceSocket {
         connection.disconnect();
         throw new NotFoundException("Not found");
       case 409:
+        MismatchedDevices mismatchedDevices;
+
         try {
-          response = Util.readFully(connection.getErrorStream());
+          response          = Util.readFully(connection.getErrorStream());
+          mismatchedDevices = JsonUtil.fromJson(response, MismatchedDevices.class);
+        } catch (JsonProcessingException e) {
+          Log.w(TAG, e);
+          throw new NonSuccessfulResponseCodeException("Bad response: " + responseCode + " " + responseMessage);
         } catch (IOException e) {
           throw new PushNetworkException(e);
         }
-        throw new MismatchedDevicesException(JsonUtil.fromJson(response, MismatchedDevices.class));
+
+        throw new MismatchedDevicesException(mismatchedDevices);
       case 410:
+        StaleDevices staleDevices;
+
         try {
-          response = Util.readFully(connection.getErrorStream());
+          response     = Util.readFully(connection.getErrorStream());
+          staleDevices = JsonUtil.fromJson(response, StaleDevices.class);
+        } catch (JsonProcessingException e) {
+          throw new NonSuccessfulResponseCodeException("Bad response: " + responseCode + " " + responseMessage);
         } catch (IOException e) {
           throw new PushNetworkException(e);
         }
-        throw new StaleDevicesException(JsonUtil.fromJson(response, StaleDevices.class));
+
+        throw new StaleDevicesException(staleDevices);
+      case 411:
+        DeviceLimit deviceLimit;
+
+        try {
+          response    = Util.readFully(connection.getErrorStream());
+          deviceLimit = JsonUtil.fromJson(response, DeviceLimit.class);
+        } catch (JsonProcessingException e) {
+          throw new NonSuccessfulResponseCodeException("Bad response: " + responseCode + " " + responseMessage);
+        } catch (IOException e) {
+          throw new PushNetworkException(e);
+        }
+
+        throw new DeviceLimitExceededException(deviceLimit);
       case 417:
         throw new ExpectationFailedException();
     }
@@ -518,6 +599,10 @@ public class PushServiceSocket {
 
       if (credentialsProvider.getPassword() != null) {
         connection.setRequestProperty("Authorization", getAuthorizationHeader());
+      }
+
+      if (userAgent != null) {
+        connection.setRequestProperty("X-Signal-Agent", userAgent);
       }
 
       if (body != null) {
